@@ -1,0 +1,1964 @@
+# SWIFT_COMBINER_MARKER: START_OF_FILE: ViewModel/ClipboardViewModel.swift
+// file: ClipboardViewModel.swift
+import SwiftUI
+import AppKit
+import UniformTypeIdentifiers
+
+enum FilterMode: String, CaseIterable, Identifiable {
+  case all = "全部"
+  case favorites = "收藏"
+  var id: Self { self }
+}
+
+@MainActor
+class ClipboardViewModel: ObservableObject {
+  @Published var clipboardHistory: [ClipboardItem] = []
+  
+  // Filter properties
+  @Published var filterMode: FilterMode = .all {
+    didSet { Task { await loadHistory(isLoadMore: false) } }
+  }
+  @Published var selectedTag: Tag? = nil {
+    didSet { Task { await loadHistory(isLoadMore: false) } }
+  }
+  @Published var searchText: String = "" {
+    didSet {
+      if !searchText.isEmpty {
+        selectedTag = nil // Clear tag filter when searching
+      }
+      Task { await loadHistory(isLoadMore: false) }
+    }
+  }
+  // <<-- NEW: Date filter properties
+  @Published var startDateFilter: Date? = nil
+  @Published var endDateFilter: Date? = nil
+  
+  // Editing and Management state
+  @Published var selectedItemForEditing: ClipboardItem? = nil
+  @Published var isShowingTagManagement = false
+  
+  @Published var allTags: [Tag] = []
+  
+  @Published var tagDeletionError: String? = nil
+  @Published var isShowingTagDeletionErrorAlert = false
+  
+  // Pagination and loading state
+  @Published private(set) var isLoading = false
+  @Published private(set) var canLoadMoreData = true
+  private var currentPage = 0
+  private let pageSize = 30
+  
+  // Internal properties
+  private var lastChangeCount: Int = NSPasteboard.general.changeCount
+  private var skipNextClipboard: Bool = false
+  private let dateFormatter: DateFormatter
+  
+  // <<-- NEW: Computed property to easily check if a date filter is applied
+  var isDateFilterActive: Bool {
+    startDateFilter != nil && endDateFilter != nil
+  }
+  
+  init() {
+    let df = DateFormatter()
+    df.dateFormat = "yyyy-MM-dd HH:mm:ss"
+    self.dateFormatter = df
+  }
+  
+  func activate() {
+    Task {
+      await loadAllTags()
+      await loadHistory(isLoadMore: false)
+      startClipboardMonitor()
+    }
+  }
+  
+  // MARK: - Date Filtering
+  
+  func setDateFilter(start: Date, end: Date) {
+    // 确保开始日期是当天的开始（00:00:00）
+    let startOfDay = Calendar.current.startOfDay(for: start)
+    
+    // 计算结束日期之后那天的开始（例如，如果选择6月7日，则计算出6月8日的 00:00:00）
+    let startOfEndDay = Calendar.current.startOfDay(for: end)
+    guard let endOfRange = Calendar.current.date(byAdding: .day, value: 1, to: startOfEndDay) else {
+      // 如果计算失败，则退回到一个安全的默认值
+      self.endDateFilter = Calendar.current.date(bySettingHour: 23, minute: 59, second: 59, of: end)
+      return
+    }
+    
+    self.startDateFilter = startOfDay
+    self.endDateFilter = endOfRange // endDate 现在是 "第二天零点"
+    
+    Task { await loadHistory(isLoadMore: false) }
+  }
+  
+  func clearDateFilter() {
+    self.startDateFilter = nil
+    self.endDateFilter = nil
+    Task { await loadHistory(isLoadMore: false) }
+  }
+  
+  
+  // MARK: - View Actions
+  
+  func loadMoreContent() {
+    guard !isLoading && canLoadMoreData else { return }
+    Task { await loadHistory(isLoadMore: true) }
+  }
+  
+  func selectItemForEditing(_ item: ClipboardItem?) {
+    Task { selectedItemForEditing = item }
+  }
+  
+  func exitEditingMode() {
+    Task {
+      let itemToUpdate = selectedItemForEditing
+      selectedItemForEditing = nil
+      if itemToUpdate != nil { await loadAllTags() }
+      await loadHistory(isLoadMore: false)
+    }
+  }
+  
+  func copyToClipboard(item: ClipboardItem) {
+    let pb = NSPasteboard.general
+    pb.clearContents()
+    var success = false
+    switch item.content {
+    case .text(let string, _): success = pb.setString(string, forType: .string)
+    case .image(let image, _): success = pb.writeObjects([image])
+    case .filePaths(let urls): success = pb.writeObjects(urls as [NSPasteboardWriting])
+    }
+    if success { skipNextClipboard = true }
+  }
+  
+  // 修改 formattedDate 方法
+  func formattedDate(from date: Date) -> String {
+    let formatter = DateFormatter()
+    formatter.dateFormat = "yyyy-MM-dd"  // 使用 yyyy-MM-dd 格式
+    return formatter.string(from: date)
+  }
+  
+  func deleteItem(with id: String) {
+    Task {
+      try? await DatabaseManager.shared.delete(id: id)
+      clipboardHistory.removeAll { $0.id == id }
+    }
+  }
+  
+  func deleteAllNonFavorites() {
+    Task {
+      try? await DatabaseManager.shared.deleteAllNonFavorites()
+      await loadHistory(isLoadMore: false)
+    }
+  }
+  
+  func toggleFavorite(for item: ClipboardItem) {
+    Task {
+      if let index = clipboardHistory.firstIndex(where: { $0.id == item.id }) {
+        clipboardHistory[index].isFavorite.toggle()
+      }
+      if selectedItemForEditing?.id == item.id {
+        selectedItemForEditing?.isFavorite.toggle()
+      }
+      try? await DatabaseManager.shared.toggleFavorite(id: item.id)
+    }
+  }
+  
+  func updateDisplayMode(for item: ClipboardItem, to newMode: DisplayMode) {
+    if let index = clipboardHistory.firstIndex(where: { $0.id == item.id }) {
+      clipboardHistory[index].displayMode = newMode
+    }
+    if selectedItemForEditing?.id == item.id {
+      selectedItemForEditing?.displayMode = newMode
+    }
+    Task { try? await DatabaseManager.shared.updateDisplayMode(for: item.id, mode: newMode) }
+  }
+  
+  func updateCustomTitle(for item: ClipboardItem, title: String) {
+    let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard item.customTitle != trimmedTitle else { return }
+    Task { try? await DatabaseManager.shared.updateCustomTitle(for: item.id, title: trimmedTitle) }
+  }
+  
+  func updateTags(for item: ClipboardItem, tags: [Tag]) {
+    let newTagNames = Set(tags.map { $0.name })
+    let oldTagNames = Set(item.tags.map { $0.name })
+    guard newTagNames != oldTagNames else { return }
+    Task {
+      let tagNames = tags.map { $0.name }
+      try? await DatabaseManager.shared.updateTags(for: item.id, with: tagNames)
+    }
+  }
+  
+  // MARK: - Tag Management & Filtering
+  
+  func toggleTagSelection(_ tag: Tag?) {
+    // If the passed tag is the same as the selected one, deselect (set to nil).
+    // Otherwise, select the new tag.
+    // If nil is passed, it always resets.
+    if selectedTag == tag {
+      selectedTag = nil
+    } else {
+      selectedTag = tag
+    }
+  }
+  
+  func addTag(name: String) async {
+    let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmedName.isEmpty else { return }
+    do {
+      try await DatabaseManager.shared.addTag(name: trimmedName)
+      await loadAllTags()
+    } catch { print("Failed to add tag: \(error)") }
+  }
+  
+  func renameTag(_ tag: Tag, to newName: String) async {
+    let trimmedName = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmedName.isEmpty else { return }
+    do {
+      try await DatabaseManager.shared.renameTag(id: tag.id, newName: newName)
+      await loadAllTags()
+    } catch { print("Failed to rename tag: \(error)") }
+  }
+  
+  func deleteTag(_ tag: Tag) async {
+    if selectedTag?.id == tag.id {
+      selectedTag = nil
+    }
+    do {
+      try await DatabaseManager.shared.deleteTag(id: tag.id)
+      await loadAllTags()
+    } catch { print("Failed to delete tag: \(error)") }
+  }
+  
+  // MARK: - Data Loading
+  func loadAllTags() async {
+    do { self.allTags = try await DatabaseManager.shared.fetchAllTags() }
+    catch { print("加载所有标签失败: \(error)") }
+  }
+  
+  private func loadHistory(isLoadMore: Bool = false) async {
+    guard !isLoading else { return }
+    
+    if !isLoadMore {
+      currentPage = 0
+      canLoadMoreData = true
+      clipboardHistory = []
+    }
+    
+    isLoading = true
+    
+    do {
+      let offset = currentPage * pageSize
+      
+      // <<-- CRITICAL FIX: 将日期过滤器参数传递给数据库查询 -->>
+      let newItems = try await DatabaseManager.shared.fetch(
+        filter: self.filterMode,
+        tag: self.selectedTag,
+        searchQuery: self.searchText,
+        startDate: self.startDateFilter, // <-- 之前缺失了这个参数
+        endDate: self.endDateFilter,   // <-- 之前缺失了这个参数
+        limit: pageSize,
+        offset: offset
+      )
+      
+      if newItems.isEmpty {
+        canLoadMoreData = false
+      } else {
+        clipboardHistory.append(contentsOf: newItems)
+        currentPage += 1
+        if newItems.count < pageSize { canLoadMoreData = false }
+      }
+    }
+    catch { print("从数据库加载历史失败: \(error)"); canLoadMoreData = false }
+    
+    isLoading = false
+  }
+  
+  private func startClipboardMonitor() {
+    Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+      Task { await self?.checkClipboard() }
+    }
+  }
+  
+  private func checkClipboard() async {
+    guard NSPasteboard.general.changeCount != lastChangeCount else { return }
+    lastChangeCount = NSPasteboard.general.changeCount
+    if skipNextClipboard { skipNextClipboard = false; return }
+    if let newItem = createItemFromPasteboard() {
+      try? await DatabaseManager.shared.save(item: newItem)
+      
+      if filterMode == .all && selectedTag == nil && searchText.isEmpty {
+        clipboardHistory.insert(newItem, at: 0)
+      }
+    }
+  }
+  
+  private func createItemFromPasteboard() -> ClipboardItem? {
+    let pb = NSPasteboard.general
+    if let fileURLs = pb.readObjects(forClasses: [NSURL.self], options: nil) as? [URL], !fileURLs.isEmpty {
+      if fileURLs.count == 1, let url = fileURLs.first,
+         let type = try? url.resourceValues(forKeys: [.typeIdentifierKey]).typeIdentifier,
+         let uttype = UTType(type) {
+        if uttype.conforms(to: .image), let image = NSImage(contentsOf: url) {
+          return ClipboardItem(id: UUID().uuidString, date: Date(), isFavorite: false, content: .image(image, filename: url.lastPathComponent))
+        }
+        if uttype.conforms(to: .text), let text = try? String(contentsOf: url, encoding: .utf8) {
+          if case .text(let lastText, _) = self.clipboardHistory.first?.content, lastText == text { return nil }
+          return ClipboardItem(id: UUID().uuidString, date: Date(), isFavorite: false, content: .text(text, filename: url.lastPathComponent))
+        }
+      }
+      return ClipboardItem(id: UUID().uuidString, date: Date(), isFavorite: false, content: .filePaths(fileURLs))
+    } else if let images = pb.readObjects(forClasses: [NSImage.self], options: nil) as? [NSImage], let firstImage = images.first {
+      return ClipboardItem(id: UUID().uuidString, date: Date(), isFavorite: false, content: .image(firstImage))
+    } else if let copied = pb.string(forType: .string), !copied.isEmpty {
+      if case .text(let lastText, _) = self.clipboardHistory.first?.content, lastText == copied { return nil }
+      return ClipboardItem(id: UUID().uuidString, date: Date(), isFavorite: false, content: .text(copied))
+    }
+    return nil
+  }
+}
+
+
+# SWIFT_COMBINER_MARKER: END_OF_FILE: ViewModel/ClipboardViewModel.swift
+
+# SWIFT_COMBINER_MARKER: START_OF_FILE: Persistence/DatabaseManager.swift
+// file: DatabaseManager.swift
+import Foundation
+import GRDB
+import AppKit
+
+class DatabaseManager {
+    static let shared = DatabaseManager()
+    
+    private let dbQueue: DatabaseQueue
+    
+    enum TagDeletionError: LocalizedError {
+        case isCurrentlyInUse(count: Int)
+        
+        var errorDescription: String? {
+            switch self {
+            case .isCurrentlyInUse(let count):
+                return "此标签正被 \(count) 条记录使用，请先从这些记录中移除该标签，然后再尝试删除。"
+            }
+        }
+    }
+    
+    private init() {
+        do {
+            let fileManager = FileManager.default
+            // 1. 获取“文稿”文件夹的 URL
+            let documentsDirectory = try fileManager.url(for: .documentDirectory, in: .userDomainMask, appropriateFor: nil, create: false)
+            print(documentsDirectory)
+            // 2. 在“文稿”文件夹下创建一个名为 "pasteBoard" 的子文件夹
+            let dbDirectory = documentsDirectory.appendingPathComponent("pasteBoard")
+            try fileManager.createDirectory(at: dbDirectory, withIntermediateDirectories: true, attributes: nil)
+            
+            // 3. 拼接最终的数据库文件 URL
+            let dbURL = dbDirectory.appendingPathComponent("history.sqlite")
+            dbQueue = try DatabaseQueue(path: dbURL.path)
+            
+            try setupDatabase()
+        } catch {
+            fatalError("数据库初始化失败: \(error)")
+        }
+    }
+    
+    private func setupDatabase() throws {
+        var migrator = DatabaseMigrator()
+        
+        migrator.registerMigration("v1") { db in
+            try db.create(table: "history") { t in
+                t.column("id", .text).primaryKey()
+                t.column("timestamp", .datetime).notNull().indexed()
+                t.column("isFavorite", .boolean).notNull()
+                t.column("contentTypeRaw", .integer).notNull()
+                t.column("textContent", .text)
+                t.column("binaryContent", .blob)
+                t.column("filePathsJSON", .text)
+            }
+        }
+        
+        migrator.registerMigration("v2_addFilename") { db in try db.alter(table: "history") { t in t.add(column: "filename", .text) } }
+        migrator.registerMigration("v4_addCustomTitle") { db in try db.alter(table: "history") { t in t.add(column: "customTitle", .text) } }
+        
+        migrator.registerMigration("v5_addTags") { db in
+            try db.create(table: "tags") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("name", .text).notNull().unique(onConflict: .ignore)
+            }
+            
+            try db.create(table: "history_tags") { t in
+                t.column("historyId", .text).notNull().references("history", onDelete: .cascade)
+                t.column("tagId", .integer).notNull().references("tags", onDelete: .cascade)
+                t.primaryKey(["historyId", "tagId"])
+            }
+        }
+        
+        migrator.registerMigration("v7_addDisplayMode") { db in
+            try db.alter(table: "history") { t in
+                t.add(column: "displayModeRaw", .integer).notNull().defaults(to: 0)
+            }
+        }
+        
+        try migrator.migrate(dbQueue)
+    }
+    
+    // MARK: - CRUD Operations
+    
+    func save(item: ClipboardItem) async throws {
+        let record = historyRecord(from: item)
+        try await dbQueue.write { db in
+            try record.save(db)
+        }
+    }
+    
+    // <<-- THIS METHOD IS NOW CORRECTED
+    func fetch(filter: FilterMode, tag: Tag? = nil, searchQuery: String = "", startDate: Date? = nil, endDate: Date? = nil, limit: Int, offset: Int) async throws -> [ClipboardItem] {
+        let records: [HistoryRecord] = try await dbQueue.read { db in
+            var request: QueryInterfaceRequest<HistoryRecord>
+            
+            switch filter {
+            case .all:
+                request = HistoryRecord.all()
+            case .favorites:
+                request = HistoryRecord.filter(HistoryRecord.Columns.isFavorite == true)
+            }
+            
+            // <<-- CHANGE: 修正日期过滤逻辑以使用半开区间 -->>
+            // 如果提供了日期范围，就添加日期过滤条件
+            if let start = startDate, let end = endDate {
+                // 使用半开区间查询 (>= start, < end)，这是最精确和健壮的方式
+                request = request.filter(HistoryRecord.Columns.timestamp >= start &&
+                                         HistoryRecord.Columns.timestamp < end)
+            }
+            
+            let trimmedQuery = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+            
+            if !trimmedQuery.isEmpty {
+                let pattern = "%\(trimmedQuery)%"
+                let tagsAlias = TableAlias(name: "aliased_tags")
+                request = request
+                    .joining(optional: HistoryRecord.tags.aliased(tagsAlias))
+                    .filter(
+                        HistoryRecord.Columns.customTitle.like(pattern) ||
+                        HistoryRecord.Columns.textContent.like(pattern) ||
+                        tagsAlias[Column("name")].like(pattern)
+                    )
+                    .distinct()
+            }
+            
+            if let tag = tag {
+                request = request.joining(required: HistoryRecord.historyTags.filter(HistoryTag.Columns.tagId == tag.id))
+            }
+            
+            request = request.order(HistoryRecord.Columns.timestamp.desc)
+            return try request.limit(limit, offset: offset).fetchAll(db)
+        }
+        
+        var items: [ClipboardItem] = []
+        for record in records {
+            if var item = clipboardItem(from: record) {
+                item.tags = try await fetchTags(for: item.id)
+                items.append(item)
+            }
+        }
+        return items
+    }
+    
+    func delete(id: String) async throws { _ = try await dbQueue.write { db in try HistoryRecord.deleteOne(db, key: id) } }
+    
+    func deleteAllNonFavorites() async throws { _ = try await dbQueue.write { db in try HistoryRecord.filter(Column("isFavorite") == false).deleteAll(db) } }
+    
+    func toggleFavorite(id: String) async throws {
+        try await dbQueue.write { db in
+            if var record = try HistoryRecord.fetchOne(db, key: id) { record.isFavorite.toggle(); try record.update(db) }
+        }
+    }
+    
+    func updateDisplayMode(for id: String, mode: DisplayMode) async throws {
+        try await dbQueue.write { db in
+            try db.execute(sql: "UPDATE history SET displayModeRaw = ? WHERE id = ?", arguments: [mode.rawValue, id])
+        }
+    }
+    
+    func updateCustomTitle(for id: String, title: String) async throws {
+        try await dbQueue.write { db in
+            try db.execute(sql: "UPDATE history SET customTitle = ? WHERE id = ?", arguments: [title, id])
+        }
+    }
+    
+    // MARK: - Tag Operations
+    
+    func addTag(name: String) async throws {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty else { return }
+        
+        try await dbQueue.write { db in
+            let newRecord = TagRecord(name: trimmedName)
+            try newRecord.insert(db, onConflict: .ignore)
+        }
+    }
+    
+    func fetchAllTags() async throws -> [Tag] {
+        try await dbQueue.read { db in
+            let tagRecords = try TagRecord.order(Column("name")).fetchAll(db)
+            return tagRecords.compactMap { $0.id != nil ? Tag(id: $0.id!, name: $0.name) : nil }
+        }
+    }
+    
+    func fetchTags(for historyId: String) async throws -> [Tag] {
+        try await dbQueue.read { db in
+            guard let historyRecord = try HistoryRecord.fetchOne(db, key: historyId) else {
+                return []
+            }
+            let tagRecords = try historyRecord.request(for: HistoryRecord.tags).fetchAll(db)
+            return tagRecords.compactMap {
+                guard let id = $0.id else { return nil }
+                return Tag(id: id, name: $0.name)
+            }
+        }
+    }
+    
+    func updateTags(for historyId: String, with tagNames: [String]) async throws {
+        try await dbQueue.write { db in
+            try HistoryTag.filter(HistoryTag.Columns.historyId == historyId).deleteAll(db)
+            for tagName in tagNames {
+                let trimmedName = tagName.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmedName.isEmpty else { continue }
+                
+                var tagRecord: TagRecord? = try TagRecord.filter(Column("name") == trimmedName).fetchOne(db)
+                
+                if tagRecord == nil {
+                    let newTag = TagRecord(name: trimmedName)
+                    try newTag.insert(db, onConflict: .ignore)
+                    tagRecord = try TagRecord.filter(Column("name") == trimmedName).fetchOne(db)
+                }
+                
+                if let tagId = tagRecord?.id {
+                    let historyTag = HistoryTag(historyId: historyId, tagId: tagId)
+                    try historyTag.insert(db, onConflict: .ignore)
+                }
+            }
+        }
+    }
+    
+    func renameTag(id: Int64, newName: String) async throws {
+        let trimmedName = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty else { return }
+        
+        try await dbQueue.write { db in
+            try db.execute(sql: "UPDATE tags SET name = ? WHERE id = ?", arguments: [trimmedName, id])
+        }
+    }
+    
+    func deleteTag(id: Int64) async throws {
+        try await dbQueue.write { db in
+            let usageCount = try HistoryTag
+                .filter(HistoryTag.Columns.tagId == id)
+                .fetchCount(db)
+            
+            if usageCount > 0 {
+                throw TagDeletionError.isCurrentlyInUse(count: usageCount)
+            } else {
+                _ = try TagRecord.deleteOne(db, key: id)
+            }
+        }
+    }
+    
+    // MARK: - Conversion Helpers
+    
+    private func clipboardItem(from record: HistoryRecord) -> ClipboardItem? {
+        let content: ClipboardContent
+        guard let contentType = HistoryRecord.ContentType(rawValue: record.contentTypeRaw) else { return nil }
+        
+        switch contentType {
+        case .text:
+            guard let text = record.textContent else { return nil }
+            content = .text(text, filename: record.filename)
+        case .image:
+            guard let data = record.binaryContent, let image = NSImage(data: data) else { return nil }
+            content = .image(image, filename: record.filename)
+        case .filePaths:
+            guard let jsonString = record.filePathsJSON,
+                  let jsonData = jsonString.data(using: .utf8),
+                  let bookmarksAsBase64 = try? JSONDecoder().decode([String].self, from: jsonData) else { return nil }
+            let urls = bookmarksAsBase64.compactMap { base64String -> URL? in
+                guard let bookmarkData = Data(base64Encoded: base64String) else { return nil }
+                var isStale = false
+                return try? URL(resolvingBookmarkData: bookmarkData, options: .withSecurityScope, relativeTo: nil, bookmarkDataIsStale: &isStale)
+            }
+            content = .filePaths(urls)
+        }
+        
+        let displayMode = DisplayMode(rawValue: record.displayModeRaw ?? 0) ?? .auto
+        
+        return ClipboardItem(id: record.id, date: record.timestamp, isFavorite: record.isFavorite, content: content, customTitle: record.customTitle, tags: [], displayMode: displayMode)
+    }
+    
+    private func historyRecord(from item: ClipboardItem) -> HistoryRecord {
+        var record = HistoryRecord(id: item.id, timestamp: item.date, isFavorite: item.isFavorite, contentTypeRaw: 0, customTitle: item.customTitle, displayModeRaw: item.displayMode.rawValue)
+        
+        switch item.content {
+        case .text(let string, let filename):
+            record.contentTypeRaw = HistoryRecord.ContentType.text.rawValue
+            record.textContent = string
+            record.filename = filename
+        case .image(let image, let filename):
+            record.contentTypeRaw = HistoryRecord.ContentType.image.rawValue
+            record.binaryContent = image.tiffRepresentation
+            record.filename = filename
+        case .filePaths(let urls):
+            record.contentTypeRaw = HistoryRecord.ContentType.filePaths.rawValue
+            let bookmarksAsBase64 = urls.compactMap { try? $0.bookmarkData(options: .withSecurityScope).base64EncodedString() }
+            if let jsonData = try? JSONEncoder().encode(bookmarksAsBase64), let jsonString = String(data: jsonData, encoding: .utf8) {
+                record.filePathsJSON = jsonString
+            }
+        }
+        return record
+    }
+}
+
+
+
+
+# SWIFT_COMBINER_MARKER: END_OF_FILE: Persistence/DatabaseManager.swift
+
+# SWIFT_COMBINER_MARKER: START_OF_FILE: Model/ClipboardModels.swift
+// file: ClipboardModels.swift
+import SwiftUI
+import GRDB
+
+// MARK: - UI & ViewModel Layer Models
+
+enum DisplayMode: Int, CaseIterable, Identifiable, Equatable {
+  case auto = 0
+  case plain = 1
+  case code = 2
+  case markdown = 3
+  
+  var id: Self { self }
+  
+  var name: String {
+    switch self {
+    case .auto: return "自动"
+    case .plain: return "纯文本"
+    case .code: return "代码"
+    case .markdown: return "Markdown"
+    }
+  }
+  
+  var iconName: String {
+    switch self {
+    case .auto: return "wand.and.stars"
+    case .plain: return "text.quote"
+    case .code: return "chevron.left.forwardslash.chevron.right"
+    case .markdown: return "text.badge.star"
+    }
+  }
+}
+
+struct ClipboardItem: Identifiable, Equatable {
+  let id: String
+  var date: Date
+  var isFavorite: Bool
+  var content: ClipboardContent
+  
+  var customTitle: String?
+  var tags: [Tag] = []
+  var displayMode: DisplayMode = .plain
+  
+  var listPreviewText: String {
+    if let title = customTitle, !title.isEmpty {
+      return "✏️ " + title
+    }
+    return content.previewText
+  }
+}
+
+struct Tag: Identifiable, Hashable, Codable {
+  var id: Int64
+  var name: String
+}
+
+enum ClipboardContent: Equatable {
+  case text(String, filename: String? = nil)
+  case image(NSImage, filename: String? = nil)
+  case filePaths([URL])
+  
+  /// Text for short list previews.
+  var previewText: String {
+    switch self {
+    case .text(let string, let filename):
+      if let filename = filename { return "📄 " + filename }
+      return string
+    case .image(_, let filename):
+      if let filename = filename { return "🖼️ " + filename }
+      return "🖼️ 图片"
+    case .filePaths(let urls):
+      if urls.count == 1 { return "📄 " + (urls.first?.lastPathComponent ?? "文件") }
+      else { return "🗂️ \(urls.count) 个项目" }
+    }
+  }
+  
+  // <<-- NEW: Text for the detailed preview window.
+  /// Provides the full text content suitable for a detail view.
+  var detailViewText: String? {
+    switch self {
+    case .text(let string, _):
+      // For a text item, return the full text content. THIS IS THE FIX.
+      return string
+    case .image:
+      // An image has no text to preview.
+      return nil
+    case .filePaths(let urls):
+      // For file paths, return a list of paths.
+      return urls.map { $0.path }.joined(separator: "\n")
+    }
+  }
+  
+  static func == (lhs: ClipboardContent, rhs: ClipboardContent) -> Bool {
+    switch (lhs, rhs) {
+    case let (.text(lText, lFile), .text(rText, rFile)):
+      return lText == rText && lFile == rFile
+    case let (.image(lImage, lFile), .image(rImage, rFile)):
+      return lImage.tiffRepresentation == rImage.tiffRepresentation && lFile == rFile
+    case let (.filePaths(lUrls), .filePaths(rUrls)):
+      return lUrls == rUrls
+    default:
+      return false
+    }
+  }
+}
+
+
+// MARK: - Database Layer Model (Unchanged)
+struct HistoryRecord: Codable, FetchableRecord, PersistableRecord, TableRecord {
+  var id: String
+  var timestamp: Date
+  var isFavorite: Bool
+  var contentTypeRaw: Int
+  
+  var textContent: String?
+  var binaryContent: Data?
+  var filePathsJSON: String?
+  var filename: String?
+  var customTitle: String?
+  var displayModeRaw: Int?
+  
+  static var databaseTableName = "history"
+  
+  enum Columns: String, ColumnExpression {
+    case id, timestamp, isFavorite, contentTypeRaw, textContent, binaryContent, filePathsJSON, filename, customTitle, displayModeRaw
+  }
+  
+  static let historyTags = hasMany(HistoryTag.self)
+  static let tags = hasMany(TagRecord.self, through: historyTags, using: HistoryTag.tag)
+  
+  enum ContentType: Int {
+    case text = 0, image = 1, filePaths = 2
+  }
+}
+
+struct TagRecord: Codable, FetchableRecord, PersistableRecord, TableRecord {
+  var id: Int64?
+  var name: String
+  static var databaseTableName = "tags"
+  enum Columns: String, ColumnExpression { case id, name }
+  static let historyTags = hasMany(HistoryTag.self)
+}
+
+struct HistoryTag: Codable, FetchableRecord, PersistableRecord, TableRecord {
+  var historyId: String
+  var tagId: Int64
+  static var databaseTableName = "history_tags"
+  enum Columns: String, ColumnExpression { case historyId, tagId }
+  static let history = belongsTo(HistoryRecord.self)
+  static let tag = belongsTo(TagRecord.self)
+}
+
+# SWIFT_COMBINER_MARKER: END_OF_FILE: Model/ClipboardModels.swift
+
+# SWIFT_COMBINER_MARKER: START_OF_FILE: Main/PasteBoardApp.swift
+import SwiftUI
+
+// ==========================================================
+// 共享代码：将 ColorSchemeManager 和 AppColorScheme 的定义放在这里
+// ==========================================================
+
+/// 定义用户可以选择的外观模式
+enum AppColorScheme: String, CaseIterable, Identifiable {
+  case system = "跟随系统"
+  case light = "浅色"
+  case dark = "深色"
+  
+  var id: Self { self }
+  
+  // NEW: 为每个模式提供一个图标
+  var iconName: String {
+    switch self {
+    case .system:
+      return "gearshape"
+    case .light:
+      return "sun.max.fill"
+    case .dark:
+      return "moon.fill"
+    }
+  }
+  
+  /// 将我们的枚举映射到 SwiftUI 的 ColorScheme 类型
+  var swiftUIScheme: ColorScheme? {
+    switch self {
+    case .light:
+      return .light
+    case .dark:
+      return .dark
+    case .system:
+      return nil // nil 意味着跟随系统
+    }
+  }
+}
+
+/// 一个可观察对象，用于管理和持久化颜色模式设置
+@MainActor
+class ColorSchemeManager: ObservableObject {
+  @Published var colorScheme: AppColorScheme {
+    didSet {
+      UserDefaults.standard.set(colorScheme.rawValue, forKey: userDefaultsKey)
+    }
+  }
+  
+  private let userDefaultsKey = "appAppearanceSetting"
+  
+  init() {
+    let storedValue = UserDefaults.standard.string(forKey: userDefaultsKey)
+    self.colorScheme = AppColorScheme(rawValue: storedValue ?? "") ?? .system
+  }
+}
+
+@available(macOS 14.0, *)
+@main
+struct pasteBoardApp: App {
+
+  @StateObject private var colorSchemeManager = ColorSchemeManager()
+  @StateObject private var viewModel = ClipboardViewModel()
+  
+  var body: some Scene {
+    // ... 您其余的 Scene 定义保持不变 ...
+    WindowGroup {
+      ContentView()
+        .environmentObject(viewModel)
+        .environmentObject(colorSchemeManager)
+    }
+    
+    WindowGroup(id: "preview-item", for: String.self) { $itemId in
+      if let validId = itemId {
+        PreviewWindowView(itemId: validId)
+          .environmentObject(viewModel)
+          .environmentObject(colorSchemeManager)
+          .preferredColorScheme(colorSchemeManager.colorScheme.swiftUIScheme)
+      }
+    }
+    .defaultSize(width: 650, height: 550)
+    .windowResizability(.contentSize)
+  }
+}
+
+# SWIFT_COMBINER_MARKER: END_OF_FILE: Main/PasteBoardApp.swift
+
+# SWIFT_COMBINER_MARKER: START_OF_FILE: Views/Representables/SyntaxHighlightingView.swift
+// file: SyntaxHighlightingView.swift
+import SwiftUI
+import Highlightr
+
+struct SyntaxHighlightingView: NSViewRepresentable {
+  // The text to display
+  let text: String
+  // The theme name (e.g., "xcode", "xcode-dusk")
+  let theme: String
+  
+  // Create the AppKit view
+  func makeNSView(context: Context) -> NSScrollView {
+    // 1. Initialize Highlightr
+    // Using `nil` for the highlightView will make it use a default NSTextStorage.
+    guard let highlightr = Highlightr() else {
+      // If Highlightr fails to initialize, return a plain text view as a fallback.
+      return createFallbackScrollView(with: text)
+    }
+    
+    // 2. Configure Highlightr
+    highlightr.setTheme(to: theme)
+    
+    // 3. Highlight the code.
+    // `fastRender` is true, `as` is nil for auto-detection of language.
+    let highlightedCode = highlightr.highlight(text, as: nil, fastRender: true)
+    
+    // 4. Create and configure the NSTextView
+    let textView = NSTextView()
+    textView.isEditable = false
+    textView.isSelectable = true
+    // Use the attributed string from Highlightr
+    textView.textStorage?.setAttributedString(highlightedCode ?? NSAttributedString(string: text))
+    textView.backgroundColor = highlightr.theme.themeBackgroundColor
+    textView.textContainerInset = NSSize(width: 10, height: 10)
+    textView.autoresizingMask = [.width]
+    textView.isVerticallyResizable = true
+    
+    // 5. Create a scroll view to contain the text view
+    let scrollView = NSScrollView()
+    scrollView.hasVerticalScroller = true
+    scrollView.documentView = textView
+    scrollView.drawsBackground = true
+    scrollView.backgroundColor = highlightr.theme.themeBackgroundColor
+    
+    // Store highlightr instance and theme name in the coordinator
+    context.coordinator.highlightr = highlightr
+    context.coordinator.currentTheme = theme
+    
+    return scrollView
+  }
+  
+  // Update the AppKit view when SwiftUI state changes
+  func updateNSView(_ nsView: NSScrollView, context: Context) {
+    guard let textView = nsView.documentView as? NSTextView,
+          let highlightr = context.coordinator.highlightr else {
+      return
+    }
+    
+    // Only update if text or theme has changed
+    if textView.string != text || context.coordinator.currentTheme != theme {
+      highlightr.setTheme(to: theme)
+      let highlightedCode = highlightr.highlight(text, as: nil, fastRender: true)
+      
+      textView.textStorage?.setAttributedString(highlightedCode ?? NSAttributedString(string: text))
+      textView.backgroundColor = highlightr.theme.themeBackgroundColor
+      nsView.backgroundColor = highlightr.theme.themeBackgroundColor
+      
+      // Update the stored theme name
+      context.coordinator.currentTheme = theme
+    }
+  }
+  
+  func makeCoordinator() -> Coordinator {
+    Coordinator()
+  }
+  
+  // Coordinator to hold references and state
+  class Coordinator {
+    var highlightr: Highlightr?
+    var currentTheme: String?
+  }
+  
+  // A helper to create a non-highlighted view if Highlightr fails
+  private func createFallbackScrollView(with text: String) -> NSScrollView {
+    let textView = NSTextView()
+    textView.string = text
+    textView.isEditable = false
+    textView.isSelectable = true
+    textView.backgroundColor = .clear
+    textView.textContainerInset = NSSize(width: 5, height: 10)
+    
+    let scrollView = NSScrollView()
+    scrollView.hasVerticalScroller = true
+    scrollView.documentView = textView
+    scrollView.drawsBackground = false
+    return scrollView
+  }
+}
+
+# SWIFT_COMBINER_MARKER: END_OF_FILE: Views/Representables/SyntaxHighlightingView.swift
+
+# SWIFT_COMBINER_MARKER: START_OF_FILE: Views/Representables/PerformantTextView.swift
+// file: PerformantTextView.swift
+import SwiftUI
+
+struct PerformantTextView: NSViewRepresentable {
+  // 将要显示的文本内容
+  let text: String
+  
+  // 创建底层的 AppKit 视图
+  func makeNSView(context: Context) -> NSScrollView {
+    // 1. 创建文本视图本身
+    let textView = NSTextView()
+    textView.string = text
+    textView.isEditable = false // 只读
+    textView.isSelectable = true // 允许用户选择和复制
+    textView.backgroundColor = .clear // 背景透明，以适应浅色/深色模式
+    textView.textContainerInset = NSSize(width: 5, height: 10) // 设置内边距
+    textView.autoresizingMask = [.width] // 宽度自动适应父视图
+    textView.isVerticallyResizable = true // 高度可变
+    
+    // 2. 创建一个滚动视图来容纳文本视图
+    let scrollView = NSScrollView()
+    scrollView.hasVerticalScroller = true // 显示垂直滚动条
+    scrollView.documentView = textView // 将文本视图放入滚动视图
+    scrollView.drawsBackground = false // 滚动视图本身不绘制背景
+    
+    return scrollView
+  }
+  
+  // 当 SwiftUI 的状态变化时，更新 AppKit 视图
+  func updateNSView(_ nsView: NSScrollView, context: Context) {
+    // 确保 documentView 是 NSTextView 类型
+    guard let textView = nsView.documentView as? NSTextView else {
+      return
+    }
+    
+    // 如果外部传入的文本与当前显示的文本不同，则更新
+    if textView.string != text {
+      textView.string = text
+    }
+  }
+}
+
+
+# SWIFT_COMBINER_MARKER: END_OF_FILE: Views/Representables/PerformantTextView.swift
+
+# SWIFT_COMBINER_MARKER: START_OF_FILE: Views/Representables/EmbeddedQuickLookView.swift
+// file: EmbeddedQuickLookView.swift
+
+import SwiftUI
+import Quartz
+
+struct EmbeddedQuickLookView: NSViewRepresentable {
+  let url: URL
+  
+  func makeNSView(context: Context) -> QLPreviewView {
+    let previewView = QLPreviewView()
+    
+    // 尝试开始访问安全范围资源
+    if context.coordinator.startAccessing(url) {
+      previewView.previewItem = url as QLPreviewItem
+    }
+    
+    return previewView
+  }
+  
+  func updateNSView(_ nsView: QLPreviewView, context: Context) {
+    // 当 URL 改变时，更新预览项目
+    guard nsView.previewItem?.previewItemURL != url else {
+      return
+    }
+    
+    // 停止访问旧的 URL，开始访问新的
+    context.coordinator.stopAccessing()
+    if context.coordinator.startAccessing(url) {
+      nsView.previewItem = url as QLPreviewItem
+    }
+  }
+  
+  // 当 SwiftUI 视图被销毁时，这个方法会被调用，我们可以在这里清理资源
+  static func dismantleNSView(_ nsView: QLPreviewView, coordinator: Coordinator) {
+    coordinator.stopAccessing()
+  }
+  
+  func makeCoordinator() -> Coordinator {
+    return Coordinator()
+  }
+  
+  // Coordinator 用于管理状态和生命周期，特别是处理安全范围资源的访问
+  class Coordinator {
+    private var isAccessing: Bool = false
+    private var currentURL: URL?
+    
+    func startAccessing(_ url: URL) -> Bool {
+      stopAccessing() // 确保先停止之前的访问
+      isAccessing = url.startAccessingSecurityScopedResource()
+      if isAccessing {
+        currentURL = url
+      }
+      return isAccessing
+    }
+    
+    func stopAccessing() {
+      if isAccessing {
+        currentURL?.stopAccessingSecurityScopedResource()
+        isAccessing = false
+        currentURL = nil
+      }
+    }
+  }
+}
+
+
+
+# SWIFT_COMBINER_MARKER: END_OF_FILE: Views/Representables/EmbeddedQuickLookView.swift
+
+# SWIFT_COMBINER_MARKER: START_OF_FILE: Views/Tags/TagManagementView.swift
+// file: TagManagementView.swift
+
+import SwiftUI
+
+struct TagManagementView: View {
+  @EnvironmentObject private var viewModel: ClipboardViewModel
+  @Environment(\.dismiss) private var dismiss
+  
+  @State private var isShowingAddAlert = false
+  @State private var newTagName: String = ""
+  
+  var body: some View {
+    VStack(spacing: 0) {
+      // 1. Header with Add button
+      HStack {
+        Text("标签管理")
+          .font(.title2).bold()
+        
+        Spacer()
+        
+        Button {
+          newTagName = ""
+          isShowingAddAlert = true
+        } label: {
+          Image(systemName: "plus.circle.fill")
+            .symbolRenderingMode(.hierarchical)
+            .imageScale(.large)
+            .foregroundColor(.accentColor)
+        }
+        .buttonStyle(.plain)
+        .help("添加新标签")
+        
+        Button("完成") {
+          dismiss()
+        }
+        .keyboardShortcut(.defaultAction) // Allows Enter key to dismiss
+      }
+      .padding()
+      .background(.regularMaterial)
+      
+      Divider()
+      
+      // 2. Custom scrollable list of tags
+      ScrollView {
+        LazyVStack(spacing: 8) {
+          ForEach(viewModel.allTags) { tag in
+            TagManagementRow(tag: tag)
+          }
+        }
+        .padding()
+      }
+      .onAppear {
+        Task { await viewModel.loadAllTags() }
+      }
+    }
+    .alert("添加新标签", isPresented: $isShowingAddAlert) {
+      TextField("标签名", text: $newTagName)
+      Button("添加") {
+        Task { await viewModel.addTag(name: newTagName) }
+      }
+      Button("取消", role: .cancel) {}
+    } message: {
+      Text("请输入新标签的名称。")
+    }
+  }
+}
+
+// ==========================================================
+// Beautified Tag Management Row
+// ==========================================================
+struct TagManagementRow: View {
+  let tag: Tag
+  @EnvironmentObject private var viewModel: ClipboardViewModel
+  
+  @State private var isHovering = false
+  @State private var isShowingRenameAlert = false
+  @State private var isShowingDeleteConfirm = false
+  @State private var tagNameForRename: String = ""
+  
+  var body: some View {
+    HStack {
+      Image(systemName: "tag.fill")
+        .font(.title3)
+        .foregroundColor(.secondary)
+        .frame(width: 30)
+      
+      Text(tag.name)
+        .font(.body)
+        .lineLimit(1)
+      
+      Spacer()
+      
+      // Action buttons appear on hover
+      if isHovering {
+        HStack(spacing: 12) {
+          Button {
+            tagNameForRename = tag.name
+            isShowingRenameAlert = true
+          } label: {
+            Image(systemName: "pencil")
+              .foregroundColor(.accentColor)
+          }
+          .buttonStyle(.plain)
+          .help("重命名")
+          
+          // <<-- CHANGED: Delete button now checks for Option key
+          Button {
+            // Check for the Option key modifier
+            if NSEvent.modifierFlags.contains(.option) {
+              // Force delete without confirmation
+              Task { await viewModel.deleteTag(tag) }
+            } else {
+              // Show confirmation alert
+              isShowingDeleteConfirm = true
+            }
+          } label: {
+            Image(systemName: "trash")
+              .foregroundColor(.red)
+          }
+          .buttonStyle(.plain)
+          .help("删除 (按住 ⌥ 键可直接删除)")
+        }
+        .transition(.opacity.animation(.easeInOut(duration: 0.2)))
+      }
+    }
+    .padding(.horizontal)
+    .padding(.vertical, 10)
+    .background(
+      RoundedRectangle(cornerRadius: 10, style: .continuous)
+        .fill(isHovering ? Color.secondary.opacity(0.15) : Color.secondary.opacity(0.05))
+    )
+    .overlay(
+      RoundedRectangle(cornerRadius: 10, style: .continuous)
+        .stroke(Color.secondary.opacity(0.1), lineWidth: 1)
+    )
+    .onHover { hovering in
+      withAnimation(.easeInOut(duration: 0.1)) {
+        self.isHovering = hovering
+      }
+    }
+    .alert("确认删除标签 \"\(tag.name)\"?", isPresented: $isShowingDeleteConfirm) {
+      Button("删除", role: .destructive) {
+        Task { await viewModel.deleteTag(tag) }
+      }
+      Button("取消", role: .cancel) {}
+    } message: {
+      Text("此操作无法撤销。")
+    }
+    .alert("重命名标签", isPresented: $isShowingRenameAlert) {
+      TextField("新标签名", text: $tagNameForRename)
+      Button("保存") {
+        Task { await viewModel.renameTag(tag, to: tagNameForRename) }
+      }
+      Button("取消", role: .cancel) {}
+    }
+  }
+}
+
+#Preview {
+  // This allows you to preview the sheet in isolation
+  let vm = ClipboardViewModel()
+  // Add some dummy data for preview
+  vm.allTags = [Tag(id: 1, name: "swiftui"), Tag(id: 2, name: "bug-report"), Tag(id: 3, name: "feature-request-long-name-to-test-truncation")]
+  
+  return TagManagementView()
+    .environmentObject(vm)
+    .frame(width: 450, height: 500)
+}
+
+# SWIFT_COMBINER_MARKER: END_OF_FILE: Views/Tags/TagManagementView.swift
+
+# SWIFT_COMBINER_MARKER: START_OF_FILE: Views/Tags/TagEditorView.swift
+// file: TagEditorView.swift
+import SwiftUI
+
+struct TagEditorView: View {
+  @Binding var tags: [Tag]
+  let allTags: [Tag]
+  @State private var newTagText = ""
+  
+  private var suggestedTags: [Tag] {
+    if newTagText.isEmpty { return [] }
+    let currentTagNames = Set(tags.map { $0.name.lowercased() })
+    return allTags.filter {
+      $0.name.lowercased().contains(newTagText.lowercased()) && !currentTagNames.contains($0.name.lowercased())
+    }
+  }
+  
+  var body: some View {
+    VStack(alignment: .leading, spacing: 8) {
+      // Display current tags
+      if !tags.isEmpty {
+        ScrollView(.horizontal, showsIndicators: false) {
+          HStack {
+            ForEach(tags) { tag in
+              TagPill(tag: tag, onRemove: { removeTag(tag) })
+            }
+          }
+        }
+      }
+      
+      // Input field for new tags
+      TextField("添加或查找标签...", text: $newTagText, onCommit: addTagFromInput)
+        .textFieldStyle(RoundedBorderTextFieldStyle())
+      
+      // Suggestions
+      if !suggestedTags.isEmpty {
+        ScrollView(.horizontal, showsIndicators: false) {
+          HStack {
+            ForEach(suggestedTags) { suggestion in
+              Button(action: { addTag(suggestion) }) {
+                Text("+ \(suggestion.name)")
+                  .font(.caption)
+                  .padding(.horizontal, 8)
+                  .padding(.vertical, 4)
+                  .background(Color.gray.opacity(0.2))
+                  .foregroundColor(.primary)
+                  .cornerRadius(8)
+              }
+              .buttonStyle(PlainButtonStyle())
+            }
+          }
+        }
+      }
+    }
+  }
+  
+  private func addTagFromInput() {
+    let tagName = newTagText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard !tagName.isEmpty else { return }
+    
+    // If a tag with the same name already exists (case-insensitive), add it.
+    if let existing = allTags.first(where: { $0.name.lowercased() == tagName }) {
+      addTag(existing)
+    } else {
+      // Otherwise, create a new tag representation.
+      // A temporary negative ID indicates it's a new tag to be created.
+      let newTag = Tag(id: -Int64.random(in: 1...1_000_000), name: tagName)
+      addTag(newTag)
+    }
+    newTagText = ""
+  }
+  
+  private func addTag(_ tag: Tag) {
+    if !tags.contains(where: { $0.name.lowercased() == tag.name.lowercased() }) {
+      tags.append(tag)
+    }
+    newTagText = ""
+  }
+  
+  private func removeTag(_ tagToRemove: Tag) {
+    tags.removeAll { $0.id == tagToRemove.id && $0.name == tagToRemove.name }
+  }
+}
+
+struct TagPill: View {
+  let tag: Tag
+  var onRemove: () -> Void
+  
+  var body: some View {
+    HStack(spacing: 4) {
+      Text(tag.name)
+      Button(action: onRemove) {
+        Image(systemName: "xmark.circle.fill")
+      }
+      .buttonStyle(BorderlessButtonStyle())
+    }
+    .font(.caption)
+    .padding(.horizontal, 8)
+    .padding(.vertical, 4)
+    .background(Color.accentColor.opacity(0.8))
+    .foregroundColor(.white)
+    .cornerRadius(10)
+  }
+}
+
+
+# SWIFT_COMBINER_MARKER: END_OF_FILE: Views/Tags/TagEditorView.swift
+
+# SWIFT_COMBINER_MARKER: START_OF_FILE: Views/Preview/PreviewWindowView.swift
+// file: PreviewWindowView.swift
+
+import SwiftUI
+import MarkdownUI
+
+@available(macOS 14.0, *)
+struct PreviewWindowView: View {
+  let itemId: String
+  
+  @EnvironmentObject private var viewModel: ClipboardViewModel
+  @Environment(\.colorScheme) private var colorScheme
+  @Environment(\.dismiss) private var dismiss
+  
+  private var item: ClipboardItem? {
+    if viewModel.selectedItemForEditing?.id == itemId {
+      return viewModel.selectedItemForEditing
+    }
+    return viewModel.clipboardHistory.first { $0.id == itemId }
+  }
+  
+  @State private var selectedMode: DisplayMode = .auto
+  
+  var body: some View {
+    if let item = item {
+      VStack(alignment: .leading, spacing: 12) {
+        // Header: 模式选择
+        HStack(alignment: .center) {
+          Picker("显示模式", selection: $selectedMode) {
+            ForEach(DisplayMode.allCases) { mode in
+              Image(systemName: mode.iconName)
+                .help(mode.name)
+                .tag(mode)
+            }
+          }
+          .pickerStyle(.segmented)
+          .frame(width: 160)
+          .onChange(of: selectedMode) {
+            viewModel.updateDisplayMode(for: item, to: selectedMode)
+          }
+          
+          Spacer()
+        }
+        
+        // Content Renderer
+        Group {
+          // <<-- CHANGED: Use the new `detailViewText` property for full content,
+          // with `previewText` as a fallback.
+          let textToRender = item.content.detailViewText ?? item.content.previewText
+          
+          let effectiveMode = item.displayMode == .auto ? detectContentType(from: textToRender) : item.displayMode
+          
+          switch effectiveMode {
+          case .markdown:
+            ScrollView {
+              Markdown(textToRender)
+                .markdownTheme(.gitHub)
+                .textSelection(.enabled)
+                .padding().frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .background(Color(nsColor: .textBackgroundColor))
+          case .code:
+            SyntaxHighlightingView(text: textToRender, theme: colorScheme == .dark ? "xcode-dusk" : "xcode")
+          case .plain, .auto:
+            PerformantTextView(text: textToRender)
+          }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.2)))
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        
+        // Footer Actions
+        HStack {
+          Button("编辑条目...") {
+            viewModel.selectItemForEditing(item)
+            dismiss()
+          }
+          Spacer()
+          Button("复制并关闭") {
+            viewModel.copyToClipboard(item: item)
+            dismiss()
+          }.keyboardShortcut(.defaultAction)
+        }
+      }
+      .padding()
+      .onAppear {
+        self.selectedMode = item.displayMode
+      }
+      .onChange(of: item) {
+        self.selectedMode = item.displayMode
+      }
+    } else {
+      Text("项目已被删除。")
+        .font(.title)
+        .foregroundColor(.secondary)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onAppear {
+          DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+            dismiss()
+          }
+        }
+    }
+  }
+}
+
+
+func detectContentType(from string: String) -> DisplayMode {
+  let trimmedString = string.trimmingCharacters(in: .whitespacesAndNewlines)
+  
+  if trimmedString.count < 3 { return .plain }
+  
+  let markdownPatterns = ["\n#", "\n##", "```", "\n* ", "\n- ", "\n1. "]
+  if markdownPatterns.contains(where: { trimmedString.contains($0) }) ||
+      trimmedString.hasPrefix("#") || trimmedString.hasPrefix("- ") || trimmedString.hasPrefix("* ") {
+    return .markdown
+  }
+  
+  let codeSymbols: Set<Character> = ["{", "}", ";", ":", "<", ">", "/", "(", ")"]
+  let symbolCount = trimmedString.filter { codeSymbols.contains($0) }.count
+  if Double(symbolCount) / Double(trimmedString.count) > 0.04 { return .code }
+  
+  if (trimmedString.hasPrefix("{") && trimmedString.hasSuffix("}")) || (trimmedString.hasPrefix("[") && trimmedString.hasSuffix("]")) { return .code }
+  
+  let codeKeywords = ["import ", "func ", "class ", "struct ", "let ", "var ", "const "]
+  if codeKeywords.contains(where: { trimmedString.contains($0) }) { return .code }
+  
+  return .plain
+}
+
+# SWIFT_COMBINER_MARKER: END_OF_FILE: Views/Preview/PreviewWindowView.swift
+
+# SWIFT_COMBINER_MARKER: START_OF_FILE: Views/Main/TagFilterPillView.swift
+//
+//  TagFilterPillView.swift
+//  pasteboard
+//
+//  Created by jiun Lee on 6/21/25.
+//
+
+import SwiftUI
+
+// ==========================================================
+// New View for Tag Filtering Pills
+// ==========================================================
+struct TagFilterPillView: View {
+  let tag: Tag
+  let isSelected: Bool
+  
+  var body: some View {
+    Text(tag.name)
+      .font(.caption)
+      .padding(.horizontal, 10)
+      .padding(.vertical, 5)
+      .background(isSelected ? Color.accentColor : Color.secondary.opacity(0.2))
+      .foregroundColor(isSelected ? .white : .primary)
+      .cornerRadius(12)
+      .contentShape(Rectangle())
+  }
+}
+
+# SWIFT_COMBINER_MARKER: END_OF_FILE: Views/Main/TagFilterPillView.swift
+
+# SWIFT_COMBINER_MARKER: START_OF_FILE: Views/Main/ClipboardRowView.swift
+//
+//  ClipboardRowView.swift
+//  pasteboard
+//
+//  Created by jiun Lee on 6/21/25.
+//
+
+import SwiftUI
+
+// ==========================================================
+// Individual List Row
+// ==========================================================
+
+struct ClipboardRowView: View {
+  let item: ClipboardItem
+  
+  @EnvironmentObject private var viewModel: ClipboardViewModel
+  @State private var showingDeleteConfirmation = false
+  @State private var isHovering = false
+  
+  var body: some View {
+    VStack(alignment: .leading, spacing: 5) {
+      if let customTitle = item.customTitle, !customTitle.isEmpty {
+        Text(customTitle).font(.headline).lineLimit(1).foregroundColor(.accentColor)
+        Text(item.content.previewText).font(.subheadline).foregroundColor(.secondary).lineLimit(2)
+      } else {
+        Text(item.content.previewText).font(.body).lineLimit(3)
+      }
+      
+      if !item.tags.isEmpty {
+        HStack {
+          ForEach(item.tags.prefix(5)) { tag in
+            Text(tag.name).font(.caption2).padding(.horizontal, 6).padding(.vertical, 2)
+              .background(Color.secondary.opacity(0.2)).cornerRadius(5).lineLimit(1)
+          }
+        }.padding(.top, 2)
+      }
+      
+      Spacer(minLength: 0)
+      
+      HStack {
+        Text(viewModel.formattedDate(from: item.date)).font(.caption2).foregroundColor(.secondary)
+        Spacer()
+        Button(action: { viewModel.toggleFavorite(for: item) }) {
+          Image(systemName: item.isFavorite ? "star.fill" : "star")
+            .foregroundColor(item.isFavorite ? .yellow : .secondary)
+        }.buttonStyle(BorderlessButtonStyle()).help("收藏")
+        Button(action: { viewModel.copyToClipboard(item: item) }) {
+          Image(systemName: "doc.on.doc").imageScale(.small)
+        }.buttonStyle(BorderlessButtonStyle()).help("复制")
+        Button(action: {
+          if NSEvent.modifierFlags.contains(.option) { viewModel.deleteItem(with: item.id) }
+          else { showingDeleteConfirmation = true }
+        }) {
+          Image(systemName: "trash").imageScale(.small).foregroundColor(.red)
+        }.buttonStyle(BorderlessButtonStyle()).help("删除（按住⌥键可直接删除）")
+          .alert("确认删除?", isPresented: $showingDeleteConfirmation) {
+            Button("删除", role: .destructive) { viewModel.deleteItem(with: item.id) }
+            Button("取消", role: .cancel) {}
+          } message: { Text("你确定要删除这条历史吗？") }
+      }
+    }
+    .padding(8)
+    .frame(minHeight: 90)
+    .background(
+      RoundedRectangle(cornerRadius: 8)
+        .fill(isHovering ? Color.primary.opacity(0.1) : Color.clear)
+    )
+    .onHover { hovering in
+      withAnimation(.easeInOut(duration: 0.1)) {
+        self.isHovering = hovering
+      }
+    }
+  }
+}
+
+# SWIFT_COMBINER_MARKER: END_OF_FILE: Views/Main/ClipboardRowView.swift
+
+# SWIFT_COMBINER_MARKER: START_OF_FILE: Views/Main/ItemEditView.swift
+//
+//  ItemEditView.swift
+//  pasteboard
+//
+//  Created by jiun Lee on 6/21/25.
+//
+
+import SwiftUI
+
+// ==========================================================
+// Item Editing View
+// ==========================================================
+
+struct ItemEditView: View {
+  @State var item: ClipboardItem
+  
+  @EnvironmentObject private var viewModel: ClipboardViewModel
+  @Environment(\.colorScheme) private var colorScheme
+  @State private var customTitle: String
+  @State private var tags: [Tag]
+  
+  init(item: ClipboardItem) {
+    _item = State(initialValue: item)
+    _customTitle = State(initialValue: item.customTitle ?? "")
+    _tags = State(initialValue: item.tags)
+  }
+  
+  var body: some View {
+    VStack(alignment: .leading, spacing: 12) {
+      HStack {
+        Button(action: { saveChanges(); viewModel.exitEditingMode() }) {
+          Label { Text("完成") } icon: { Image(systemName: "chevron.left") }
+        }
+        Spacer()
+        Text("编辑条目").font(.headline)
+        Spacer()
+        Button(action: { item.isFavorite.toggle() }) {
+          Image(systemName: item.isFavorite ? "star.fill" : "star").font(.title2).foregroundColor(item.isFavorite ? .yellow : .secondary)
+        }.buttonStyle(BorderlessButtonStyle())
+      }
+      .padding(.bottom, 8)
+      
+      Group {
+        let textToRender = item.content.previewText
+        let effectiveMode = item.displayMode == .auto ? detectContentType(from: textToRender) : item.displayMode
+        
+        switch effectiveMode {
+        case .markdown:
+          ScrollView {
+            Markdown(textToRender)
+              .markdownTheme(.gitHub)
+              .textSelection(.enabled)
+              .padding()
+              .frame(maxWidth: .infinity, alignment: .leading)
+          }
+          .background(Color(nsColor: .textBackgroundColor))
+        case .code:
+          SyntaxHighlightingView(text: textToRender, theme: colorScheme == .dark ? "xcode-dusk" : "xcode")
+        case .plain, .auto:
+          PerformantTextView(text: textToRender)
+        }
+      }
+      .clipShape(RoundedRectangle(cornerRadius: 8))
+      .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.2)))
+      .frame(maxHeight: .infinity)
+      
+      VStack(alignment: .leading, spacing: 10) {
+        TextField("自定义标题 (可选)", text: $customTitle).textFieldStyle(RoundedBorderTextFieldStyle()).font(.title2)
+        
+        Picker("显示模式", selection: $item.displayMode) {
+          ForEach(DisplayMode.allCases) { mode in Text(mode.name).tag(mode) }
+        }
+        .pickerStyle(.segmented)
+        
+        VStack(alignment: .leading) {
+          Text("标签:").font(.subheadline).foregroundColor(.secondary)
+          TagEditorView(tags: $tags, allTags: viewModel.allTags)
+        }
+      }.padding(.top)
+    }
+    .padding().onDisappear(perform: saveChanges)
+  }
+  
+  private func saveChanges() {
+    viewModel.updateDisplayMode(for: item, to: item.displayMode)
+    viewModel.toggleFavorite(for: item)
+    viewModel.updateCustomTitle(for: item, title: customTitle)
+    viewModel.updateTags(for: item, tags: tags)
+  }
+}
+
+# SWIFT_COMBINER_MARKER: END_OF_FILE: Views/Main/ItemEditView.swift
+
+# SWIFT_COMBINER_MARKER: START_OF_FILE: Views/Main/DateFilterView.swift
+//
+//  DateFilterView.swift
+//  pasteboard
+//
+//  Created by jiun Lee on 6/21/25.
+//
+import SwiftUI
+
+// ==========================================================
+// New View for the Date Filter Popover
+// ==========================================================
+struct DateFilterView: View {
+  @EnvironmentObject private var viewModel: ClipboardViewModel
+  @State private var isShowingPopover = false
+  
+  // Local state for the popover's date pickers
+  @State private var startDate: Date
+  @State private var endDate: Date
+  
+  init() {
+    // Initialize local state with the ViewModel's current state
+    _startDate = State(initialValue: Calendar.current.startOfDay(for: Date()))
+    _endDate = State(initialValue: Calendar.current.date(byAdding: .day, value: 1, to: Calendar.current.startOfDay(for: Date())) ?? Date())
+  }
+  
+  var body: some View {
+    Button {
+      // When opening the popover, sync local state with viewmodel
+      startDate = viewModel.startDateFilter ?? Calendar.current.startOfDay(for: Date())
+      endDate = viewModel.endDateFilter ?? Calendar.current.date(byAdding: .day, value: 1, to: startDate) ?? Date()
+      isShowingPopover = true
+    } label: {
+      Image(systemName: "calendar")
+      // Highlight the button if the date filter is active
+        .foregroundColor(viewModel.isDateFilterActive ? .accentColor : .primary)
+    }
+    .help("按日期筛选")
+    .popover(isPresented: $isShowingPopover, arrowEdge: .bottom) {
+      VStack(spacing: 16) {
+        Text("选择日期范围")
+          .font(.headline)
+        
+        // 修改日期选择器显示格式
+        DatePicker("开始日期", selection: $startDate, displayedComponents: .date)
+          .environment(\.locale, Locale(identifier: "zh_CN"))
+          .environment(\.calendar, Calendar(identifier: .gregorian))
+        
+        DatePicker("结束日期", selection: $endDate, in: startDate..., displayedComponents: .date)
+          .environment(\.locale, Locale(identifier: "zh_CN"))
+          .environment(\.calendar, Calendar(identifier: .gregorian))
+        
+        
+        HStack {
+          Button("清除") {
+            viewModel.clearDateFilter()
+            isShowingPopover = false
+          }
+          
+          Spacer()
+          
+          Button("应用") {
+            viewModel.setDateFilter(start: startDate, end: endDate)
+            isShowingPopover = false
+          }
+          .keyboardShortcut(.defaultAction)
+        }
+      }
+      .padding()
+      .frame(width: 280)
+    }
+  }
+}
+
+# SWIFT_COMBINER_MARKER: END_OF_FILE: Views/Main/DateFilterView.swift
+
+# SWIFT_COMBINER_MARKER: START_OF_FILE: Views/Main/ContentView.swift
+// file: ContentView.swift
+import SwiftUI
+import AppKit
+import MarkdownUI
+
+// ==========================================================
+// Main Entry View
+// ==========================================================
+
+struct ContentView: View {
+  @EnvironmentObject private var viewModel: ClipboardViewModel
+  @EnvironmentObject private var colorSchemeManager: ColorSchemeManager
+  
+  var body: some View {
+    VStack(spacing: 0) {
+      if let itemToEdit = viewModel.selectedItemForEditing {
+        ItemEditView(item: itemToEdit)
+      } else {
+        MainListView()
+      }
+    }
+    .onAppear { viewModel.activate() }
+    .preferredColorScheme(colorSchemeManager.colorScheme.swiftUIScheme)
+    .animation(.default, value: viewModel.selectedItemForEditing?.id)
+  }
+}
+
+// ==========================================================
+// Main List View
+// ==========================================================
+
+struct MainListView: View {
+  @EnvironmentObject private var viewModel: ClipboardViewModel
+  @EnvironmentObject private var colorSchemeManager: ColorSchemeManager
+  @Environment(\.openWindow) private var openWindow
+  @State private var showingClearAllConfirmation = false
+  
+  private var searchBar: some View {
+    HStack {
+      Image(systemName: "magnifyingglass").foregroundColor(.secondary)
+      TextField("搜索标题、内容或标签...", text: $viewModel.searchText)
+        .textFieldStyle(.plain)
+      if !viewModel.searchText.isEmpty {
+        Button(action: { viewModel.searchText = "" }) {
+          Image(systemName: "xmark.circle.fill")
+        }
+        .buttonStyle(.borderless)
+        .foregroundColor(.secondary)
+      }
+    }
+    .padding(.horizontal, 8).padding(.vertical, 5)
+    .background(Color(nsColor: .windowBackgroundColor))
+    .cornerRadius(8)
+    .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.3), lineWidth: 1))
+  }
+  
+  private var tagFilteringBar: some View {
+    HStack(spacing: 12) {
+      Button {
+        viewModel.isShowingTagManagement = true
+      } label: {
+        Image(systemName: "gearshape")
+      }
+      .help("管理所有标签")
+      .buttonStyle(.plain)
+      
+      ScrollView(.horizontal, showsIndicators: false) {
+        HStack(spacing: 6) {
+          if viewModel.selectedTag != nil {
+            Button {
+              viewModel.toggleTagSelection(nil)
+            } label: {
+              Image(systemName: "xmark.circle.fill")
+                .foregroundColor(.accentColor)
+            }
+            .buttonStyle(.plain)
+            .help("清除标签筛选")
+          }
+          ForEach(viewModel.allTags) { tag in
+            TagFilterPillView(
+              tag: tag,
+              isSelected: viewModel.selectedTag == tag
+            )
+            .onTapGesture {
+              viewModel.toggleTagSelection(tag)
+            }
+          }
+        }
+      }
+    }
+    .padding(.horizontal)
+    .padding(.vertical, 8)
+    .animation(.easeInOut, value: viewModel.selectedTag)
+  }
+  
+  var body: some View {
+    VStack(spacing: 0) {
+      // Header Area
+      VStack(spacing: 0) {
+        searchBar.padding([.horizontal, .top])
+        
+        if !viewModel.allTags.isEmpty {
+          tagFilteringBar
+        } else {
+          Spacer().frame(height: 38)
+        }
+      }
+      
+      Divider()
+      
+      // Main Content List
+      List {
+        ForEach(viewModel.clipboardHistory) { item in
+          ClipboardRowView(item: item)
+            .listRowInsets(EdgeInsets(top: 2, leading: 8, bottom: 2, trailing: 8))
+            .contentShape(Rectangle())
+            .onTapGesture {
+              openWindow(id: "preview-item", value: item.id)
+            }
+        }
+      }
+      .listStyle(.plain)
+      
+      // Footer Toolbar
+      HStack {
+        if viewModel.filterMode == .all && viewModel.searchText.isEmpty && viewModel.selectedTag == nil {
+          Button(role: .destructive) { showingClearAllConfirmation = true }
+          label: { Label("清空", systemImage: "trash.circle") }
+            .help("清空所有非收藏条目")
+            .alert("确认清空？", isPresented: $showingClearAllConfirmation) {
+              Button("清空", role: .destructive) { viewModel.deleteAllNonFavorites() }
+              Button("取消", role: .cancel) {}
+            } message: { Text("此操作将删除所有未收藏的历史记录，且无法撤销。") }
+        }
+        
+        // <<-- NEW: Date Filter Button View is added here
+        DateFilterView()
+        
+        Spacer()
+        
+        HStack(spacing: 24) {
+          Picker("筛选", selection: $viewModel.filterMode) {
+            ForEach(FilterMode.allCases) { mode in
+              Text(mode.rawValue).tag(mode)
+            }
+          }
+          .pickerStyle(.segmented)
+          .frame(width: 150)
+          
+          Picker("", selection: $colorSchemeManager.colorScheme) {
+            ForEach(AppColorScheme.allCases) { scheme in
+              Image(systemName: scheme.iconName)
+                .help(scheme.rawValue)
+                .tag(scheme)
+            }
+          }
+          .pickerStyle(.segmented)
+          .frame(width: 120)
+        }
+      }
+      .padding(.horizontal).padding(.vertical, 10).background(.thinMaterial)
+    }
+    .sheet(isPresented: $viewModel.isShowingTagManagement) {
+      TagManagementView()
+        .environmentObject(viewModel)
+        .frame(minWidth: 400, minHeight: 500)
+    }
+  }
+}
+
+
+
+extension View {
+  func onContinuousHover(cursor: NSCursor) -> some View {
+    self.onHover { inside in
+      if inside {
+        cursor.push()
+      } else {
+        NSCursor.pop()
+      }
+    }
+  }
+}
+
+# SWIFT_COMBINER_MARKER: END_OF_FILE: Views/Main/ContentView.swift
+
