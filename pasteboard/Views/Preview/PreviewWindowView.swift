@@ -2,7 +2,7 @@
 
 import SwiftUI
 import MarkdownUI
-import UniformTypeIdentifiers // <-- 1. 导入 UniformTypeIdentifiers
+import UniformTypeIdentifiers // <-- 导入 UniformTypeIdentifiers
 
 @available(macOS 14.0, *)
 struct PreviewWindowView: View {
@@ -24,6 +24,7 @@ struct PreviewWindowView: View {
     if let item = item {
       VStack(alignment: .leading, spacing: 12) {
         // --- HEADER ---
+        // 只有文本内容才需要显示模式选择器
         if case .text = item.content {
           HStack(alignment: .center) {
             Picker("显示模式", selection: $selectedMode) {
@@ -52,7 +53,7 @@ struct PreviewWindowView: View {
               .frame(maxWidth: .infinity, maxHeight: .infinity)
 
           case .filePaths(let urls):
-            // --- 2. 修改文件预览逻辑 ---
+            // 2. 修改文件预览逻辑
             if let firstUrl = urls.first {
                 // 检查文件类型
                 if let type = try? firstUrl.resourceValues(forKeys: [.typeIdentifierKey]).typeIdentifier,
@@ -69,6 +70,7 @@ struct PreviewWindowView: View {
             }
             
           case .text:
+            // 直接使用 ContentRendererView，它会处理显示模式和内容
             ContentRendererView(item: item)
           }
         }

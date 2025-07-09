@@ -4,6 +4,12 @@ import Foundation
 import Carbon.HIToolbox
 import AppKit
 
+// 定义一个代理协议，用于通知 App hotkey 被按下
+protocol HotkeyManagerDelegate: AnyObject {
+    func hotkeyManagerDidReceiveMainHotkey()
+    func hotkeyManagerDidReceiveQuickSelectHotkey() // 新增的代理方法
+}
+
 // C-Style callback function
 private func eventHandler(
     nextHandler: EventHandlerCallRef?,
@@ -13,11 +19,17 @@ private func eventHandler(
     guard let userData = userData else { return noErr }
     let manager = Unmanaged<HotkeyManager>.fromOpaque(userData).takeUnretainedValue()
 
-    // *** THIS IS THE FIX ***
-    // We are on a background thread here.
-    // Dispatch the work to the main thread before calling the @MainActor method.
+    // 获取按下的热键ID
+    var hotKeyID = EventHotKeyID()
+    GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil, MemoryLayout<EventHotKeyID>.size, nil, &hotKeyID)
+
+    // Dispatch to main thread (ALWAYS dispatch UI/MainActor related work to main thread)
     DispatchQueue.main.async {
-        manager.handleHotkey()
+        if hotKeyID.signature == "pbmh".fourCharCode && hotKeyID.id == 1 { // 主窗口热键
+            manager.delegate?.hotkeyManagerDidReceiveMainHotkey()
+        } else if hotKeyID.signature == "pbmh".fourCharCode && hotKeyID.id == 2 { // 快速选择热键
+            manager.delegate?.hotkeyManagerDidReceiveQuickSelectHotkey()
+        }
     }
 
     return noErr
@@ -25,73 +37,77 @@ private func eventHandler(
 
 @MainActor
 class HotkeyManager {
-    private var hotKeyRef: EventHotKeyRef?
-    
-    /// Registers the global hotkey: Command + Option + V
+    weak var delegate: HotkeyManagerDelegate? // 声明代理
+
+    private var mainHotKeyRef: EventHotKeyRef? // 原Cmd+Option+V 的引用
+    private var quickSelectHotKeyRef: EventHotKeyRef? // 新Cmd+Shift+V 的引用
+
+    /// Registers the global hotkeys
     func register() {
-        // 1. Define a unique ID for the hotkey.
-        var hotKeyID = EventHotKeyID(signature: "pbmh".fourCharCode, id: 1)
-        
-        // 2. Define the event type we want to listen for.
-        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: OSType(kEventHotKeyPressed))
-        
-        // 3. Get a pointer to this instance to pass to the C callback.
-        let selfPtr = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
-        
-        // 4. Register the hotkey with the system.
-        let status = RegisterEventHotKey(
+        // Main App Hotkey: Command + Option + V (ID: 1)
+        var mainHotKeyID = EventHotKeyID(signature: "pbmh".fourCharCode, id: 1) // Unique ID 1
+        let mainStatus = RegisterEventHotKey(
             UInt32(kVK_ANSI_V),
             UInt32(cmdKey + optionKey),
-            hotKeyID,
+            mainHotKeyID,
             GetApplicationEventTarget(),
             0,
-            &hotKeyRef
+            &mainHotKeyRef
         )
-
-        guard status == noErr else {
-            print("Error: Unable to register global hotkey (Cmd+Option+V). Status: \(status)")
+        guard mainStatus == noErr else {
+            print("Error: Unable to register main hotkey (Cmd+Option+V). Status: \(mainStatus)")
+            // 考虑在此处向用户展示错误
             return
         }
+        print("✅ Global hotkey (Cmd+Option+V) registered successfully.")
+
+        // Quick Select Hotkey: Command + Shift + V (ID: 2)
+        var quickSelectHotKeyID = EventHotKeyID(signature: "pbmh".fourCharCode, id: 2) // Unique ID 2
+        let quickSelectStatus = RegisterEventHotKey(
+            UInt32(kVK_ANSI_V),
+            UInt32(cmdKey + shiftKey),
+            quickSelectHotKeyID,
+            GetApplicationEventTarget(),
+            0,
+            &quickSelectHotKeyRef
+        )
+        guard quickSelectStatus == noErr else {
+            print("Error: Unable to register quick select hotkey (Cmd+Shift+V). Status: \(quickSelectStatus)")
+            // 如果注册失败，不阻止应用启动，但用户会收到功能不完整的提示
+            return
+        }
+        print("✅ Global hotkey (Cmd+Shift+V) for Quick Select registered successfully.")
         
-        // 5. Install an event handler to link the hotkey to our callback function.
+        // Install Event Handler for both hotkeys (only once is needed for the target)
+        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: OSType(kEventHotKeyPressed))
+        let selfPtr = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
         let installStatus = InstallEventHandler(
             GetApplicationEventTarget(),
-            eventHandler, // The C-style callback
-            1,
-            &eventType,
-            selfPtr,
-            nil
+            eventHandler, // The C-style callback function for all hotkeys
+            1, // Number of event types
+            &eventType, // Array of event types (just one in this case)
+            selfPtr, // User data to pass to the handler (our HotkeyManager instance)
+            nil // Out parameter for the event handler reference (not needed here)
         )
 
         guard installStatus == noErr else {
             print("Error: Unable to install hotkey event handler. Status: \(installStatus)")
             return
         }
-
-        print("✅ Global hotkey (Cmd+Option+V) registered successfully.")
     }
 
-    /// Unregisters the hotkey to clean up resources.
+    /// Unregisters all hotkeys to clean up resources.
     func unregister() {
-        if let hotKeyRef = self.hotKeyRef {
-            UnregisterEventHotKey(hotKeyRef)
-            self.hotKeyRef = nil
+        if let ref = mainHotKeyRef {
+            UnregisterEventHotKey(ref)
+            mainHotKeyRef = nil
         }
-    }
-    
-    /// This is the action that will be performed when the hotkey is pressed.
-    /// This method is already on the Main Actor, so it can safely manipulate UI.
-    fileprivate func handleHotkey() {
-        print("Hotkey Cmd+Option+V pressed!")
-
-        NSRunningApplication.current.activate(options: .activateIgnoringOtherApps)
-        
-        if let window = NSApplication.shared.windows.first {
-            if window.isMiniaturized {
-                window.deminiaturize(nil)
-            }
-            window.makeKeyAndOrderFront(nil)
+        if let ref = quickSelectHotKeyRef {
+            UnregisterEventHotKey(ref)
+            quickSelectHotKeyRef = nil
         }
+        // No need to uninstall event handler explicitly unless you want to remove *all* handlers
+        // for this target, which is generally not necessary on app termination.
     }
 }
 

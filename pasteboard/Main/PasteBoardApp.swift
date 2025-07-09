@@ -57,23 +57,26 @@ class ColorSchemeManager: ObservableObject {
 @main
 struct pasteBoardApp: App {
   @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
-  @StateObject private var colorSchemeManager = ColorSchemeManager()
-  @StateObject private var viewModel = ClipboardViewModel()
+  // 移除或注释掉这两个 StateObject，因为 AppDelegate 会提供它们
+  // @StateObject private var colorSchemeManager = ColorSchemeManager()
+  // @StateObject private var viewModel = ClipboardViewModel()
   
   var body: some Scene {
     // ... 您其余的 Scene 定义保持不变 ...
     WindowGroup {
       ContentView()
-        .environmentObject(viewModel)
-        .environmentObject(colorSchemeManager)
+        // 现在从 appDelegate 访问这些对象，因为 AppDelegate 是它们的拥有者
+        .environmentObject(appDelegate.clipboardViewModel)
+        .environmentObject(appDelegate.colorSchemeManager)
     }
     
     WindowGroup(id: "preview-item", for: String.self) { $itemId in
       if let validId = itemId {
         PreviewWindowView(itemId: validId)
-          .environmentObject(viewModel)
-          .environmentObject(colorSchemeManager)
-          .preferredColorScheme(colorSchemeManager.colorScheme.swiftUIScheme)
+            // 现在从 appDelegate 访问这些对象
+          .environmentObject(appDelegate.clipboardViewModel)
+          .environmentObject(appDelegate.colorSchemeManager)
+          .preferredColorScheme(appDelegate.colorSchemeManager.colorScheme.swiftUIScheme)
       }
     }
     .defaultSize(width: 650, height: 550)

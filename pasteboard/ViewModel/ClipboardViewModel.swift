@@ -1,4 +1,4 @@
-// file: ClipboardViewModel.swift
+// file: ViewModel/ClipboardViewModel.swift
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
@@ -12,7 +12,7 @@ enum FilterMode: String, CaseIterable, Identifiable {
 @MainActor
 class ClipboardViewModel: ObservableObject {
     @Published var clipboardHistory: [ClipboardItem] = []
-    
+
     // Filter properties
     @Published var filterMode: FilterMode = .all {
         didSet { Task { await loadHistory(isLoadMore: false) } }
@@ -31,38 +31,38 @@ class ClipboardViewModel: ObservableObject {
     // <<-- NEW: Date filter properties
     @Published var startDateFilter: Date? = nil
     @Published var endDateFilter: Date? = nil
-    
+
     // Editing and Management state
     @Published var selectedItemForEditing: ClipboardItem? = nil
     @Published var isShowingTagManagement = false
-    
+
     @Published var allTags: [Tag] = []
-    
+
     @Published var tagDeletionError: String? = nil
     @Published var isShowingTagDeletionErrorAlert = false
-    
+
     // Pagination and loading state
     @Published private(set) var isLoading = false
     @Published private(set) var canLoadMoreData = true
     private var currentPage = 0
     private let pageSize = 30
-    
+
     // Internal properties
     private var lastChangeCount: Int = NSPasteboard.general.changeCount
-    private var skipNextClipboard: Bool = false
+    var skipNextClipboard: Bool = false // 从 private 改为 internal/public 以便外部设置
     private let dateFormatter: DateFormatter
-    
+
     // <<-- NEW: Computed property to easily check if a date filter is applied
     var isDateFilterActive: Bool {
         startDateFilter != nil && endDateFilter != nil
     }
-    
+
     init() {
         let df = DateFormatter()
         df.dateFormat = "yyyy-MM-dd HH:mm:ss"
         self.dateFormatter = df
     }
-    
+
     func activate() {
         Task {
             await loadAllTags()
@@ -70,13 +70,13 @@ class ClipboardViewModel: ObservableObject {
             startClipboardMonitor()
         }
     }
-    
+
     // MARK: - Date Filtering
-    
+
     func setDateFilter(start: Date, end: Date) {
         // 确保开始日期是当天的开始（00:00:00）
         let startOfDay = Calendar.current.startOfDay(for: start)
-        
+
         // 计算结束日期之后那天的开始（例如，如果选择6月7日，则计算出6月8日的 00:00:00）
         let startOfEndDay = Calendar.current.startOfDay(for: end)
         guard let endOfRange = Calendar.current.date(byAdding: .day, value: 1, to: startOfEndDay) else {
@@ -84,31 +84,31 @@ class ClipboardViewModel: ObservableObject {
             self.endDateFilter = Calendar.current.date(bySettingHour: 23, minute: 59, second: 59, of: end)
             return
         }
-        
+
         self.startDateFilter = startOfDay
         self.endDateFilter = endOfRange // endDate 现在是 "第二天零点"
-        
+
         Task { await loadHistory(isLoadMore: false) }
     }
-    
+
     func clearDateFilter() {
         self.startDateFilter = nil
         self.endDateFilter = nil
         Task { await loadHistory(isLoadMore: false) }
     }
-    
-    
+
+
     // MARK: - View Actions
-    
+
     func loadMoreContent() {
         guard !isLoading && canLoadMoreData else { return }
         Task { await loadHistory(isLoadMore: true) }
     }
-    
+
     func selectItemForEditing(_ item: ClipboardItem?) {
         Task { selectedItemForEditing = item }
     }
-    
+
     func exitEditingMode() {
         Task {
             let itemToUpdate = selectedItemForEditing
@@ -117,7 +117,7 @@ class ClipboardViewModel: ObservableObject {
             await loadHistory(isLoadMore: false)
         }
     }
-    
+
     func copyToClipboard(item: ClipboardItem) {
         let pb = NSPasteboard.general
         pb.clearContents()
@@ -129,28 +129,28 @@ class ClipboardViewModel: ObservableObject {
         }
         if success { skipNextClipboard = true }
     }
-    
+
     // 修改 formattedDate 方法
     func formattedDate(from date: Date) -> String {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd"  // 使用 yyyy-MM-dd 格式
         return formatter.string(from: date)
     }
-    
+
     func deleteItem(with id: String) {
         Task {
             try? await DatabaseManager.shared.delete(id: id)
             clipboardHistory.removeAll { $0.id == id }
         }
     }
-    
+
     func deleteAllNonFavorites() {
         Task {
             try? await DatabaseManager.shared.deleteAllNonFavorites()
             await loadHistory(isLoadMore: false)
         }
     }
-    
+
     func toggleFavorite(for item: ClipboardItem) {
         Task {
             if let index = clipboardHistory.firstIndex(where: { $0.id == item.id }) {
@@ -162,7 +162,7 @@ class ClipboardViewModel: ObservableObject {
             try? await DatabaseManager.shared.toggleFavorite(id: item.id)
         }
     }
-    
+
     func updateDisplayMode(for item: ClipboardItem, to newMode: DisplayMode) {
         if let index = clipboardHistory.firstIndex(where: { $0.id == item.id }) {
             clipboardHistory[index].displayMode = newMode
@@ -172,13 +172,13 @@ class ClipboardViewModel: ObservableObject {
         }
         Task { try? await DatabaseManager.shared.updateDisplayMode(for: item.id, mode: newMode) }
     }
-    
+
     func updateCustomTitle(for item: ClipboardItem, title: String) {
         let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard item.customTitle != trimmedTitle else { return }
         Task { try? await DatabaseManager.shared.updateCustomTitle(for: item.id, title: trimmedTitle) }
     }
-    
+
     func updateTags(for item: ClipboardItem, tags: [Tag]) {
         let newTagNames = Set(tags.map { $0.name })
         let oldTagNames = Set(item.tags.map { $0.name })
@@ -188,9 +188,9 @@ class ClipboardViewModel: ObservableObject {
             try? await DatabaseManager.shared.updateTags(for: item.id, with: tagNames)
         }
     }
-    
+
     // MARK: - Tag Management & Filtering
-    
+
     func toggleTagSelection(_ tag: Tag?) {
         // If the passed tag is the same as the selected one, deselect (set to nil).
         // Otherwise, select the new tag.
@@ -201,7 +201,7 @@ class ClipboardViewModel: ObservableObject {
             selectedTag = tag
         }
     }
-    
+
     func addTag(name: String) async {
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedName.isEmpty else { return }
@@ -210,7 +210,7 @@ class ClipboardViewModel: ObservableObject {
             await loadAllTags()
         } catch { print("Failed to add tag: \(error)") }
     }
-    
+
     func renameTag(_ tag: Tag, to newName: String) async {
         let trimmedName = newName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedName.isEmpty else { return }
@@ -219,7 +219,7 @@ class ClipboardViewModel: ObservableObject {
             await loadAllTags()
         } catch { print("Failed to rename tag: \(error)") }
     }
-    
+
     func deleteTag(_ tag: Tag) async {
         if selectedTag?.id == tag.id {
             selectedTag = nil
@@ -236,27 +236,28 @@ class ClipboardViewModel: ObservableObject {
             self.isShowingTagDeletionErrorAlert = true
         }
     }
-    
+
     // MARK: - Data Loading
     func loadAllTags() async {
         do { self.allTags = try await DatabaseManager.shared.fetchAllTags() }
         catch { print("加载所有标签失败: \(error)") }
     }
-    
-    private func loadHistory(isLoadMore: Bool = false) async {
+
+    // 访问级别从 `private` 修改为 `internal` (Swift 默认级别)
+    func loadHistory(isLoadMore: Bool = false) async {
         guard !isLoading else { return }
-        
+
         if !isLoadMore {
             currentPage = 0
             canLoadMoreData = true
             clipboardHistory = []
         }
-        
+
         isLoading = true
-        
+
         do {
             let offset = currentPage * pageSize
-            
+
             // <<-- CRITICAL FIX: 将日期过滤器参数传递给数据库查询 -->>
             let newItems = try await DatabaseManager.shared.fetch(
                 filter: self.filterMode,
@@ -267,7 +268,7 @@ class ClipboardViewModel: ObservableObject {
                 limit: pageSize,
                 offset: offset
             )
-            
+
             if newItems.isEmpty {
                 canLoadMoreData = false
             } else {
@@ -277,29 +278,43 @@ class ClipboardViewModel: ObservableObject {
             }
         }
         catch { print("从数据库加载历史失败: \(error)"); canLoadMoreData = false }
-        
+
         isLoading = false
     }
-    
+
     private func startClipboardMonitor() {
         Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { await self?.checkClipboard() }
         }
     }
-    
+
     private func checkClipboard() async {
         guard NSPasteboard.general.changeCount != lastChangeCount else { return }
         lastChangeCount = NSPasteboard.general.changeCount
-        if skipNextClipboard { skipNextClipboard = false; return }
+
+        // UPDATED COMMENT:
+        // skipNextClipboard 用于避免应用自身的复制操作（如用户点击“复制”按钮或通过快速粘贴功能）
+        // 再次触发历史记录新增。当此标志为 true 时，表示此次剪贴板变更由应用主动发起，应跳过记录。
+        if skipNextClipboard {
+            skipNextClipboard = false // 重置标志，以便下次正常的外部复制可以被记录
+            return // 跳过此事件，不添加到历史记录
+        }
+
         if let newItem = createItemFromPasteboard() {
             try? await DatabaseManager.shared.save(item: newItem)
-            
-            if filterMode == .all && selectedTag == nil && searchText.isEmpty {
+
+            // 如果没有任何筛选条件被激活 (全选模式，无搜索，无标签，无日期筛选)，则直接插入到内存列表顶部
+            let noFiltersActive = filterMode == .all && selectedTag == nil && searchText.isEmpty && startDateFilter == nil && endDateFilter == nil
+
+            if noFiltersActive {
                 clipboardHistory.insert(newItem, at: 0)
+            } else {
+                // 否则，重新加载历史记录，以确保筛选后的列表也能正确更新
+                await loadHistory(isLoadMore: false)
             }
         }
     }
-    
+
     private func createItemFromPasteboard() -> ClipboardItem? {
         let pb = NSPasteboard.general
         if let fileURLs = pb.readObjects(forClasses: [NSURL.self], options: nil) as? [URL], !fileURLs.isEmpty {
@@ -324,4 +339,3 @@ class ClipboardViewModel: ObservableObject {
         return nil
     }
 }
-
